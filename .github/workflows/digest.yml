@@ -25,4 +25,5 @@ jobs:
       - name: Run digest script
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' }}
         run: python daily_digest.py
