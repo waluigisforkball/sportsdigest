@@ -27,3 +27,15 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' }}
         run: python daily_digest.py
+
+      - name: Keep-alive commit
+        # GitHub auto-disables scheduled workflows after 60 days with no repo
+        # activity. This commits a small timestamp file every run so the repo
+        # never goes quiet, keeping the schedule alive indefinitely.
+        run: |
+          echo "Last run: $(date -u)" > .last_run
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .last_run
+          git diff --quiet && git diff --staged --quiet || git commit -m "chore: keep-alive [skip ci]"
+          git push
