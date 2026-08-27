@@ -1,0 +1,28 @@
+name: Daily Sports Digest
+
+on:
+  schedule:
+    # Two triggers to cover both EST (UTC-5) and EDT (UTC-4), so the digest
+    # lands around 6-7am ET year-round. daily_digest.py checks the actual
+    # local hour and exits early on the "wrong" one for the current season.
+    - cron: "30 10 * * *"  # 6:30am EDT / 5:30am EST
+    - cron: "30 11 * * *"  # 7:30am EDT / 6:30am EST
+  workflow_dispatch: {}  # allows manual run from the Actions tab for testing
+
+jobs:
+  send-digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run digest script
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python daily_digest.py
