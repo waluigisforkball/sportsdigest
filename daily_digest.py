@@ -143,10 +143,13 @@ def build_embed(games_by_league: dict, today_label: str) -> dict:
 
 def main():
     now_local = datetime.now(LOCAL_TZ)
+    force_run = os.environ.get("FORCE_RUN") == "true"
 
     # DST-safe gate: only actually post if we're in the target local hour window.
     # (Workflow schedules two UTC triggers to cover both EST and EDT.)
-    if now_local.hour not in TARGET_HOURS:
+    # Manual "Run workflow" triggers set FORCE_RUN=true to skip this, so you
+    # can test at any time of day.
+    if not force_run and now_local.hour not in TARGET_HOURS:
         print(f"[skip] local hour is {now_local.hour}, not in {TARGET_HOURS}. Exiting.")
         return
 
