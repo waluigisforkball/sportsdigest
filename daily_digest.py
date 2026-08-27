@@ -45,17 +45,27 @@ SPORT_EMOJI = {
 EMBED_COLOR = 0x1A6EF5
 
 
-def fetch_league_games(sport_path: str, league_path: str, date_str: str):
-    """Fetch today's scoreboard for a given ESPN sport/league."""
+def fetch_league_scoreboard(sport_path: str, league_path: str, date_str: str):
+    """Fetch today's full scoreboard payload for a given ESPN sport/league."""
     url = f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/{league_path}/scoreboard"
     params = {"dates": date_str}
     try:
         resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
-        return resp.json().get("events", [])
+        return resp.json()
     except requests.RequestException as e:
         print(f"[warn] failed to fetch {league_path}: {e}", file=sys.stderr)
-        return []
+        return {}
+
+
+def extract_league_logo(payload: dict) -> str | None:
+    """Pull the league logo URL out of a scoreboard payload, if present."""
+    leagues = payload.get("leagues", [])
+    if leagues:
+        logos = leagues[0].get("logos", [])
+        if logos:
+            return logos[0].get("href")
+    return None
 
 
 def format_game_line(event: dict) -> str:
@@ -112,33 +122,37 @@ def format_game_line(event: dict) -> str:
     return line
 
 
-def build_embed(games_by_league: dict, today_label: str) -> dict:
-    fields = []
-    for league_name, lines in games_by_league.items():
+def build_embeds(league_data: dict, today_label: str) -> list[dict]:
+    """One embed per league (with its logo as thumbnail), plus a title embed."""
+    embeds = [{
+        "title": f"🗓️ Sports Digest — {today_label}",
+        "color": EMBED_COLOR,
+    }]
+
+    any_games = False
+    for league_name, (lines, logo_url) in league_data.items():
         if not lines:
             continue  # omit sports with nothing on today
+        any_games = True
         emoji = SPORT_EMOJI.get(league_name, "")
-        fields.append({
-            "name": f"{emoji} {league_name}",
-            "value": "\n".join(lines),
-            "inline": False,
-        })
-
-    if not fields:
-        fields.append({
-            "name": "Nothing today",
-            "value": "No games found across your tracked leagues.",
-            "inline": False,
-        })
-
-    return {
-        "embeds": [{
-            "title": f"🗓️ Sports Digest — {today_label}",
+        embed = {
+            "title": f"{emoji} {league_name}",
+            "description": "\n".join(lines),
             "color": EMBED_COLOR,
-            "fields": fields,
-            "footer": {"text": "Times shown in Eastern (ET)"},
-        }]
-    }
+        }
+        if logo_url:
+            embed["thumbnail"] = {"url": logo_url}
+        embeds.append(embed)
+
+    if not any_games:
+        embeds.append({
+            "title": "Nothing today",
+            "description": "No games found across your tracked leagues.",
+            "color": EMBED_COLOR,
+        })
+
+    embeds[-1]["footer"] = {"text": "Times shown in Eastern (ET)"}
+    return embeds
 
 
 def main():
@@ -160,15 +174,18 @@ def main():
     date_str = now_local.strftime("%Y%m%d")
     today_label = now_local.strftime("%A, %B %-d")
 
-    games_by_league = {}
+    league_data = {}
     for league_name, sport_path, league_path in LEAGUES:
-        events = fetch_league_games(sport_path, league_path, date_str)
+        payload = fetch_league_scoreboard(sport_path, league_path, date_str)
+        events = payload.get("events", [])
         lines = [format_game_line(e) for e in events]
-        games_by_league[league_name] = lines
+        logo_url = extract_league_logo(payload)
+        league_data[league_name] = (lines, logo_url)
 
-    payload = build_embed(games_by_league, today_label)
+    embeds = build_embeds(league_data, today_label)
 
-    resp = requests.post(WEBHOOK_URL, json=payload, timeout=15)
+    # Discord allows max 10 embeds per message
+    resp = requests.post(WEBHOOK_URL, json={"embeds": embeds[:10]}, timeout=15)
     if resp.status_code >= 300:
         print(f"[error] Discord webhook failed: {resp.status_code} {resp.text}", file=sys.stderr)
         sys.exit(1)
