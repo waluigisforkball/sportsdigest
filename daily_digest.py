@@ -12,8 +12,7 @@ a generous time window plus a same-day dedupe file (last_post_date.txt)
 stop them from double-posting.
 
 Probe mode (PROBE=true, set via the workflow's "probe" input) prints what
-each endpoint returns to the Actions log and posts nothing. Use it to verify
-league IDs / sport IDs for the less common leagues.
+each endpoint returns to the Actions log and posts nothing.
 """
 
 import json
@@ -41,32 +40,31 @@ MAX_DESC = 3800          # Discord embed description cap is 4096
 MAX_EMBEDS_PER_MSG = 10  # Discord cap
 MAX_CHARS_PER_MSG = 5500  # Discord caps total embed text at 6000 per message
 FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
+MAX_TENNIS_LINES_PER_TOUR = 20  # Slam days have 100+ matches; keep it readable
 
 # Favorites: starred + bolded, and sorted to the top of their section.
 FAVORITE_TEAMS = {"Orioles", "Ravens", "Jazz", "Mammoth"}
 
 # Only surface tennis/golf when a major is actually underway
-# (case-insensitive substring match on the tournament name ESPN returns).
+# (case-insensitive substring match on each tournament's own name).
 MAJOR_TENNIS_KEYWORDS = ["australian open", "french open", "roland garros", "wimbledon", "us open"]
 MAJOR_GOLF_KEYWORDS = ["masters tournament", "pga championship", "u.s. open", "open championship"]
 
-# International baseball via MLB's Stats API. The script looks up /sports at
-# runtime and matches these keywords against each sport's name. If a league
-# isn't found (or matches the wrong thing), run probe mode, then pin its ID
-# in "sport_id" below.
+# International baseball via MLB's Stats API.
+#  - NPB / KBO are their own "sports" in the API (confirmed by probe).
+#  - ABL / Mexico live inside the "Winter Leagues" sport, so they're matched by
+#    LEAGUE name. LEAGUE_SEARCH_SPORT_IDS is where we look for those leagues.
 INTL_BASEBALL = {
-    "NPB": {"keywords": ["nippon", "npb"], "sport_id": None},
-    "KBO": {"keywords": ["korea", "kbo"], "sport_id": None},
-    "ABL": {"keywords": ["australia"], "sport_id": None},
-    "Mexico": {"keywords": ["mexic"], "sport_id": None},
+    "NPB": {"sport_keywords": ["nippon", "npb"], "league_keywords": []},
+    "KBO": {"sport_keywords": ["korea", "kbo"], "league_keywords": []},
+    "ABL": {"sport_keywords": [], "league_keywords": ["australia"]},
+    "Mexico": {"sport_keywords": [], "league_keywords": ["mexic"]},
 }
+LEAGUE_SEARCH_SPORT_IDS = [17, 23, 51]  # Winter Leagues, Independent, International
 
 # Display order = priority order.
 # (section name, emoji, kind, config)
 #   espn: config = [(sub-label or None, ESPN sport path, ESPN league path), ...]
-#
-# NOTE: the rugby league IDs below are from memory and UNVERIFIED. Run probe
-# mode to confirm each returns the expected competition name.
 SECTIONS = [
     ("MLB", "⚾", "espn", [(None, "baseball", "mlb")]),
     ("International Baseball", "🌏", "intl_baseball", None),
@@ -126,14 +124,21 @@ def extract_league_logo(payload):
     return None
 
 
-def tournament_name(payload):
-    leagues = payload.get("leagues", [])
-    if leagues and leagues[0].get("name"):
-        return leagues[0]["name"]
-    events = payload.get("events", [])
-    if events and events[0].get("name"):
-        return events[0]["name"]
-    return ""
+def event_name(event):
+    return f"{event.get('name', '')} {event.get('shortName', '')}".strip()
+
+
+def is_major(event, keywords):
+    name = event_name(event).lower()
+    return any(kw in name for kw in keywords)
+
+
+def event_competitions(event):
+    """Tennis events nest matches under groupings; others use competitions."""
+    comps = list(event.get("competitions") or [])
+    for g in event.get("groupings") or []:
+        comps.extend(g.get("competitions") or [])
+    return comps
 
 
 # --------------------------------------------------------------------------
@@ -195,79 +200,121 @@ def fetch_espn_section(sources, date_str):
     return games, logo
 
 
+def _player_name(c):
+    if not c:
+        return "TBD"
+    athlete = c.get("athlete") or {}
+    roster = c.get("roster") or {}
+    team = c.get("team") or {}
+    return (athlete.get("shortName") or athlete.get("displayName")
+            or roster.get("shortDisplayName") or roster.get("displayName")
+            or team.get("shortDisplayName") or team.get("displayName") or "TBD")
+
+
 def fetch_tennis_majors(date_str):
-    """ATP + WTA; only returns matches if a Grand Slam is live today."""
+    """ATP + WTA; only includes tournaments whose own name is a Grand Slam."""
     games, logo = [], None
     for tour in ("atp", "wta"):
         payload = fetch_espn_scoreboard("tennis", tour, date_str)
-        name = tournament_name(payload).lower()
-        if not any(kw in name for kw in MAJOR_TENNIS_KEYWORDS):
-            continue
-        if logo is None:
-            logo = extract_league_logo(payload)
+        tour_games = []
         for event in payload.get("events", []):
-            comp = (event.get("competitions") or [{}])[0]
-            competitors = comp.get("competitors", [])
-
-            def player_name(c):
-                if not c:
-                    return "TBD"
-                athlete = c.get("athlete", {})
-                return athlete.get("shortName") or athlete.get("displayName", "TBD")
-
-            p1 = next((c for c in competitors if c.get("order") == 1),
-                      competitors[0] if competitors else None)
-            p2 = next((c for c in competitors if c.get("order") == 2),
-                      competitors[1] if len(competitors) > 1 else None)
-            dt = parse_iso(event.get("date"))
-            notes = comp.get("notes") or [{}]
-            round_name = event.get("shortName") or notes[0].get("headline", "")
-            line = f"{player_name(p1)} vs {player_name(p2)} — {fmt_time(dt)}"
-            if round_name:
-                line += f" ({round_name})"
-            games.append({"line": line, "fav": False, "dt": dt})
+            if not is_major(event, MAJOR_TENNIS_KEYWORDS):
+                continue
+            if logo is None:
+                logo = extract_league_logo(payload)
+            tname = event.get("name", "Grand Slam")
+            comps = event_competitions(event)
+            if not comps:
+                # Couldn't find individual matches: at least announce the major.
+                detail = event.get("status", {}).get("type", {}).get("detail", "")
+                line = f"{tname}" + (f" — {detail}" if detail else "")
+                tour_games.append({"line": line, "fav": False, "dt": parse_iso(event.get("date"))})
+                continue
+            for comp in comps:
+                competitors = comp.get("competitors", [])
+                p1 = next((c for c in competitors if c.get("order") == 1),
+                          competitors[0] if competitors else None)
+                p2 = next((c for c in competitors if c.get("order") == 2),
+                          competitors[1] if len(competitors) > 1 else None)
+                dt = parse_iso(comp.get("date") or comp.get("startDate") or event.get("date"))
+                rnd = (comp.get("round") or {}).get("displayName")
+                if not rnd:
+                    notes = comp.get("notes") or [{}]
+                    rnd = notes[0].get("headline", "")
+                line = f"{_player_name(p1)} vs {_player_name(p2)} — {fmt_time(dt)}"
+                if rnd:
+                    line += f" ({rnd})"
+                tour_games.append({"line": line, "fav": False, "dt": dt})
+        tour_games.sort(key=lambda g: g["dt"] or FAR_FUTURE)
+        if len(tour_games) > MAX_TENNIS_LINES_PER_TOUR:
+            extra = len(tour_games) - MAX_TENNIS_LINES_PER_TOUR
+            tour_games = tour_games[:MAX_TENNIS_LINES_PER_TOUR]
+            tour_games.append({"line": f"…and {extra} more {tour.upper()} matches",
+                               "fav": False, "dt": FAR_FUTURE})
+        games.extend(tour_games)
     return games, logo
 
 
 def fetch_golf_majors(date_str):
-    """PGA scoreboard; only returns a summary if a major is underway today."""
+    """PGA scoreboard; only includes tournaments whose own name is a major."""
     payload = fetch_espn_scoreboard("golf", "pga", date_str)
-    name = tournament_name(payload).lower()
-    if not any(kw in name for kw in MAJOR_GOLF_KEYWORDS):
-        return [], None
-    games = []
+    games, logo = [], None
     for event in payload.get("events", []):
+        if not is_major(event, MAJOR_GOLF_KEYWORDS):
+            continue
+        if logo is None:
+            logo = extract_league_logo(payload)
         line = event.get("name", "Golf Major")
         detail = event.get("status", {}).get("type", {}).get("detail", "")
         if detail:
             line += f" — {detail}"
         games.append({"line": line, "fav": False, "dt": parse_iso(event.get("date"))})
-    return games, extract_league_logo(payload)
+    return games, logo
 
+
+# --------------------------------------------------------------------------
+# International baseball (MLB Stats API)
+# --------------------------------------------------------------------------
 
 def statsapi_sports():
     return get_json(f"{STATSAPI_BASE}/sports").get("sports", [])
 
 
-def resolve_intl_sport_ids(sports):
-    """Map league label -> list of (sport_id) using pinned IDs or name keywords."""
+def statsapi_leagues(sport_id):
+    return get_json(f"{STATSAPI_BASE}/leagues", {"sportId": sport_id}).get("leagues", [])
+
+
+def resolve_intl_targets(sports):
+    """label -> list of {"sport_id", "league_id" (or None)} to query."""
+    league_catalog = []
+    for sid in LEAGUE_SEARCH_SPORT_IDS:
+        for lg in statsapi_leagues(sid):
+            league_catalog.append({"sport_id": sid, "id": lg.get("id"),
+                                   "name": lg.get("name", ""),
+                                   "abbr": lg.get("abbreviation", "")})
     resolved = {}
     for label, cfg in INTL_BASEBALL.items():
-        if cfg["sport_id"]:
-            resolved[label] = [cfg["sport_id"]]
-            continue
-        ids = []
+        targets, seen = [], set()
         for s in sports:
-            haystack = f"{s.get('name', '')} {s.get('abbreviation', '')}".lower()
-            if any(kw in haystack for kw in cfg["keywords"]):
-                ids.append(s["id"])
-        resolved[label] = ids
+            hay = f"{s.get('name', '')} {s.get('abbreviation', '')}".lower()
+            if cfg["sport_keywords"] and any(kw in hay for kw in cfg["sport_keywords"]):
+                targets.append({"sport_id": s["id"], "league_id": None})
+        for lg in league_catalog:
+            hay = f"{lg['name']} {lg['abbr']}".lower()
+            if cfg["league_keywords"] and any(kw in hay for kw in cfg["league_keywords"]):
+                key = (lg["sport_id"], lg["id"])
+                if key not in seen:
+                    seen.add(key)
+                    targets.append({"sport_id": lg["sport_id"], "league_id": lg["id"]})
+        resolved[label] = targets
     return resolved
 
 
-def fetch_statsapi_games(sport_id, date_str_dashed):
-    data = get_json(f"{STATSAPI_BASE}/schedule",
-                    {"sportId": sport_id, "date": date_str_dashed, "hydrate": "team"})
+def fetch_statsapi_games(sport_id, date_dashed, league_id=None):
+    params = {"sportId": sport_id, "date": date_dashed, "hydrate": "team"}
+    if league_id:
+        params["leagueId"] = league_id
+    data = get_json(f"{STATSAPI_BASE}/schedule", params)
     games = []
     for d in data.get("dates", []):
         games.extend(d.get("games", []))
@@ -276,13 +323,17 @@ def fetch_statsapi_games(sport_id, date_str_dashed):
 
 def fetch_intl_baseball(date_dashed):
     sports = statsapi_sports()
-    resolved = resolve_intl_sport_ids(sports)
-    out = []
-    for label, ids in resolved.items():
-        if not ids:
-            print(f"[info] no Stats API sport matched for {label}; skipping", file=sys.stderr)
-        for sid in ids:
-            for g in fetch_statsapi_games(sid, date_dashed):
+    resolved = resolve_intl_targets(sports)
+    out, seen_games = [], set()
+    for label, targets in resolved.items():
+        if not targets:
+            print(f"[info] no Stats API match for {label}; skipping", file=sys.stderr)
+        for t in targets:
+            for g in fetch_statsapi_games(t["sport_id"], date_dashed, t["league_id"]):
+                pk = g.get("gamePk")
+                if pk in seen_games:
+                    continue
+                seen_games.add(pk)
                 teams = g.get("teams", {})
                 away = teams.get("away", {}).get("team", {}).get("name", "TBD")
                 home = teams.get("home", {}).get("team", {}).get("name", "TBD")
@@ -423,16 +474,22 @@ def run_probe(date_str, date_dashed):
             print(f"{name}{' / ' + label if label else ''} [{sport_path}/{league_path}]: "
                   f"competition={lname!r} events_today={n}")
 
-    print("\n--- Tennis / golf current tournament ---")
-    for tour in ("atp", "wta"):
-        p = fetch_espn_scoreboard("tennis", tour, date_str)
-        print(f"tennis/{tour}: {tournament_name(p)!r} events={len(p.get('events', []))}")
-    p = fetch_espn_scoreboard("golf", "pga", date_str)
-    print(f"golf/pga: {tournament_name(p)!r} events={len(p.get('events', []))}")
-
-    print("\n--- ESPN rugby competition list (to find league IDs) ---")
-    data = get_json("https://sports.core.api.espn.com/v2/sports/rugby/leagues", {"limit": 200})
-    print(json.dumps(data, indent=1)[:3000] or "(empty)")
+    print("\n--- Tennis / golf: tournaments ESPN lists today ---")
+    for sport, tour, kws in (("tennis", "atp", MAJOR_TENNIS_KEYWORDS),
+                             ("tennis", "wta", MAJOR_TENNIS_KEYWORDS),
+                             ("golf", "pga", MAJOR_GOLF_KEYWORDS)):
+        p = fetch_espn_scoreboard(sport, tour, date_str)
+        print(f"{sport}/{tour}: {len(p.get('events', []))} event(s)")
+        for ev in p.get("events", [])[:6]:
+            comps = event_competitions(ev)
+            print(f"   - {ev.get('name')!r} major={is_major(ev, kws)} "
+                  f"matches_found={len(comps)} event_keys={sorted(ev.keys())}")
+            if comps:
+                c0 = comps[0]
+                print(f"       first match keys={sorted(c0.keys())}")
+                comp0 = c0.get("competitors") or []
+                if comp0:
+                    print(f"       first competitor keys={sorted(comp0[0].keys())}")
 
     print("\n--- MLB Stats API sports (id | name | games today) ---")
     sports = statsapi_sports()
@@ -440,9 +497,16 @@ def run_probe(date_str, date_dashed):
         n = len(fetch_statsapi_games(s["id"], date_dashed))
         print(f"{s['id']} | {s.get('name')} | {s.get('abbreviation')} | games_today={n}")
 
-    print("\n--- Resolved international baseball matches ---")
-    for label, ids in resolve_intl_sport_ids(sports).items():
-        print(f"{label}: sport ids {ids or 'NONE FOUND'}")
+    print("\n--- Leagues inside searched sports (sportId | leagueId | name | games today) ---")
+    for sid in LEAGUE_SEARCH_SPORT_IDS:
+        for lg in statsapi_leagues(sid):
+            n = len(fetch_statsapi_games(sid, date_dashed, lg.get("id")))
+            print(f"{sid} | {lg.get('id')} | {lg.get('name')} | {lg.get('abbreviation')} "
+                  f"| games_today={n}")
+
+    print("\n--- Resolved international baseball targets ---")
+    for label, targets in resolve_intl_targets(sports).items():
+        print(f"{label}: {targets or 'NONE FOUND'}")
 
 
 # --------------------------------------------------------------------------
