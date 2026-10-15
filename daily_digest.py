@@ -50,17 +50,25 @@ FAVORITE_TEAMS = {"Orioles", "Ravens", "Jazz", "Mammoth"}
 MAJOR_TENNIS_KEYWORDS = ["australian open", "french open", "roland garros", "wimbledon", "us open"]
 MAJOR_GOLF_KEYWORDS = ["masters tournament", "pga championship", "u.s. open", "open championship"]
 
-# International baseball via MLB's Stats API.
-#  - NPB / KBO are their own "sports" in the API (confirmed by probe).
-#  - ABL / Mexico live inside the "Winter Leagues" sport, so they're matched by
-#    LEAGUE name. LEAGUE_SEARCH_SPORT_IDS is where we look for those leagues.
+# International baseball + softball via MLB's Stats API. IDs are pinned from
+# probe output (see the probe log for the full list of available leagues).
+#   "sport_ids": whole Stats API sports; "leagues": (sport_id, league_id) pairs
+#   for leagues that live inside a bigger sport (e.g. Winter Leagues).
+# Other leagues available if wanted later:
+#   Dominican LIDOM (17, 131), Puerto Rico (17, 133)
 INTL_BASEBALL = {
-    "NPB": {"sport_keywords": ["nippon", "npb"], "league_keywords": []},
-    "KBO": {"sport_keywords": ["korea", "kbo"], "league_keywords": []},
-    "ABL": {"sport_keywords": [], "league_keywords": ["australia"]},
-    "Mexico": {"sport_keywords": [], "league_keywords": ["mexic"]},
+    "NPB": {"sport_ids": [31]},
+    "KBO": {"sport_ids": [32]},
+    "ABL": {"leagues": [(17, 595)]},
+    "Mexico": {"leagues": [(17, 132), (23, 125)]},  # LMP winter + LMB summer
+    "CPBL": {"leagues": [(51, 552)]},
+    "Venezuela": {"leagues": [(17, 135)]},
+    "AFL": {"leagues": [(17, 119)]},  # Arizona Fall League
 }
-LEAGUE_SEARCH_SPORT_IDS = [17, 23, 51]  # Winter Leagues, Independent, International
+SOFTBALL = {
+    "AUSL": {"sport_ids": [576]},  # "Women's Professional Softball" - verify in season
+}
+PROBE_LEAGUE_SPORT_IDS = [17, 23, 51, 576]
 
 # Display order = priority order.
 # (section name, emoji, kind, config)
@@ -68,6 +76,7 @@ LEAGUE_SEARCH_SPORT_IDS = [17, 23, 51]  # Winter Leagues, Independent, Internati
 SECTIONS = [
     ("MLB", "⚾", "espn", [(None, "baseball", "mlb")]),
     ("International Baseball", "🌏", "intl_baseball", None),
+    ("Softball", "🥎", "softball", None),
     ("NFL", "🏈", "espn", [(None, "football", "nfl")]),
     ("NBA", "🏀", "espn", [(None, "basketball", "nba")]),
     ("NHL", "🏒", "espn", [(None, "hockey", "nhl")]),
@@ -284,32 +293,6 @@ def statsapi_leagues(sport_id):
     return get_json(f"{STATSAPI_BASE}/leagues", {"sportId": sport_id}).get("leagues", [])
 
 
-def resolve_intl_targets(sports):
-    """label -> list of {"sport_id", "league_id" (or None)} to query."""
-    league_catalog = []
-    for sid in LEAGUE_SEARCH_SPORT_IDS:
-        for lg in statsapi_leagues(sid):
-            league_catalog.append({"sport_id": sid, "id": lg.get("id"),
-                                   "name": lg.get("name", ""),
-                                   "abbr": lg.get("abbreviation", "")})
-    resolved = {}
-    for label, cfg in INTL_BASEBALL.items():
-        targets, seen = [], set()
-        for s in sports:
-            hay = f"{s.get('name', '')} {s.get('abbreviation', '')}".lower()
-            if cfg["sport_keywords"] and any(kw in hay for kw in cfg["sport_keywords"]):
-                targets.append({"sport_id": s["id"], "league_id": None})
-        for lg in league_catalog:
-            hay = f"{lg['name']} {lg['abbr']}".lower()
-            if cfg["league_keywords"] and any(kw in hay for kw in cfg["league_keywords"]):
-                key = (lg["sport_id"], lg["id"])
-                if key not in seen:
-                    seen.add(key)
-                    targets.append({"sport_id": lg["sport_id"], "league_id": lg["id"]})
-        resolved[label] = targets
-    return resolved
-
-
 def fetch_statsapi_games(sport_id, date_dashed, league_id=None):
     params = {"sportId": sport_id, "date": date_dashed, "hydrate": "team"}
     if league_id:
@@ -321,19 +304,20 @@ def fetch_statsapi_games(sport_id, date_dashed, league_id=None):
     return games
 
 
-def fetch_intl_baseball(date_dashed):
-    sports = statsapi_sports()
-    resolved = resolve_intl_targets(sports)
-    out, seen_games = [], set()
-    for label, targets in resolved.items():
-        if not targets:
-            print(f"[info] no Stats API match for {label}; skipping", file=sys.stderr)
-        for t in targets:
-            for g in fetch_statsapi_games(t["sport_id"], date_dashed, t["league_id"]):
+def group_targets(cfg):
+    return [(sid, None) for sid in cfg.get("sport_ids", [])] + list(cfg.get("leagues", []))
+
+
+def fetch_statsapi_group(group, date_dashed):
+    """group: label -> {"sport_ids": [...], "leagues": [(sport_id, league_id)]}"""
+    out, seen = [], set()
+    for label, cfg in group.items():
+        for sid, lid in group_targets(cfg):
+            for g in fetch_statsapi_games(sid, date_dashed, lid):
                 pk = g.get("gamePk")
-                if pk in seen_games:
+                if pk in seen:
                     continue
-                seen_games.add(pk)
+                seen.add(pk)
                 teams = g.get("teams", {})
                 away = teams.get("away", {}).get("team", {}).get("name", "TBD")
                 home = teams.get("home", {}).get("team", {}).get("name", "TBD")
@@ -364,7 +348,9 @@ def collect_sections(date_str, date_dashed):
             if kind == "espn":
                 games, logo = fetch_espn_section(cfg, date_str)
             elif kind == "intl_baseball":
-                games, logo = fetch_intl_baseball(date_dashed)
+                games, logo = fetch_statsapi_group(INTL_BASEBALL, date_dashed)
+            elif kind == "softball":
+                games, logo = fetch_statsapi_group(SOFTBALL, date_dashed)
             elif kind == "tennis":
                 games, logo = fetch_tennis_majors(date_str)
             elif kind == "golf":
@@ -497,16 +483,19 @@ def run_probe(date_str, date_dashed):
         n = len(fetch_statsapi_games(s["id"], date_dashed))
         print(f"{s['id']} | {s.get('name')} | {s.get('abbreviation')} | games_today={n}")
 
-    print("\n--- Leagues inside searched sports (sportId | leagueId | name | games today) ---")
-    for sid in LEAGUE_SEARCH_SPORT_IDS:
+    print("\n--- Leagues inside key sports (sportId | leagueId | name | games today) ---")
+    for sid in PROBE_LEAGUE_SPORT_IDS:
         for lg in statsapi_leagues(sid):
             n = len(fetch_statsapi_games(sid, date_dashed, lg.get("id")))
             print(f"{sid} | {lg.get('id')} | {lg.get('name')} | {lg.get('abbreviation')} "
                   f"| games_today={n}")
 
-    print("\n--- Resolved international baseball targets ---")
-    for label, targets in resolve_intl_targets(sports).items():
-        print(f"{label}: {targets or 'NONE FOUND'}")
+    print("\n--- Configured international baseball / softball targets ---")
+    for title, group in (("baseball", INTL_BASEBALL), ("softball", SOFTBALL)):
+        for label, cfg in group.items():
+            for sid, lid in group_targets(cfg):
+                n = len(fetch_statsapi_games(sid, date_dashed, lid))
+                print(f"{title}/{label}: sport={sid} league={lid} games_today={n}")
 
 
 # --------------------------------------------------------------------------
