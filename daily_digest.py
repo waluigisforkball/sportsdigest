@@ -68,16 +68,35 @@ INTL_BASEBALL = {
 SOFTBALL = {
     "AUSL": {"sport_ids": [576]},  # "Women's Professional Softball" - verify in season
 }
+# WBC + Olympic baseball get their own section (Stats API sport 51 = International
+# Baseball, sport 52 = Olympic Baseball). Empty outside tournament windows.
+WBC_OLYMPICS = {
+    "WBC": {"leagues": [(51, 160)]},
+    "WBC Qualifiers": {"leagues": [(51, 159)]},
+    "Olympics": {"sport_ids": [52]},
+}
 PROBE_LEAGUE_SPORT_IDS = [17, 23, 51, 576]
+
+# US national team soccer: ESPN national-team competitions, filtered to games
+# where the US is playing. League slugs are from memory - confirm with probe.
+USA_TEAM_KEYS = {"united states", "usa"}
+USA_SOCCER_SOURCES = [
+    ("Friendly", "soccer", "fifa.friendly"),
+    ("Women's Friendly", "soccer", "fifa.friendly.w"),
+    ("Nations League", "soccer", "concacaf.nations.league"),
+    ("Gold Cup", "soccer", "concacaf.gold"),
+    ("World Cup", "soccer", "fifa.world"),
+    ("Women's World Cup", "soccer", "fifa.wwc"),
+]
 
 # Display order = priority order.
 # (section name, emoji, kind, config)
 #   espn: config = [(sub-label or None, ESPN sport path, ESPN league path), ...]
 SECTIONS = [
-    ("MLB", "⚾", "espn", [(None, "baseball", "mlb")]),
-    ("International Baseball", "🌏", "intl_baseball", None),
-    ("Softball", "🥎", "softball", None),
+    ("WBC & Olympic Baseball", "🌍", "wbc", None),
     ("NFL", "🏈", "espn", [(None, "football", "nfl")]),
+    ("MLB", "⚾", "espn", [(None, "baseball", "mlb")]),
+    ("US National Team Soccer", "🇺🇸", "espn_usa", USA_SOCCER_SOURCES),
     ("NBA", "🏀", "espn", [(None, "basketball", "nba")]),
     ("NHL", "🏒", "espn", [(None, "hockey", "nhl")]),
     ("EPL", "⚽", "espn", [(None, "soccer", "eng.1")]),
@@ -86,9 +105,17 @@ SECTIONS = [
         ("Six Nations", "rugby", "180659"),
         ("Rugby Championship", "rugby", "244293"),
     ]),
-    ("Tennis", "🎾", "tennis", None),
-    ("Golf", "⛳", "golf", None),
+    ("Golf Majors", "⛳", "golf", None),
+    ("Tennis Majors", "🎾", "tennis", None),
+    # --- "other stuff" ---
+    ("Softball", "🥎", "softball", None),
+    ("International Baseball", "🌏", "intl_baseball", None),
 ]
+
+# Discord webhooks can't make collapsible dropdowns (that needs a full bot with
+# interactive components). Closest option: hide the section body behind a
+# spoiler, so one tap reveals it.
+SPOILER_SECTIONS = {"International Baseball"}
 
 
 # --------------------------------------------------------------------------
@@ -198,14 +225,29 @@ def format_espn_game(event, label=None):
     return {"line": line, "fav": fav, "dt": dt}
 
 
-def fetch_espn_section(sources, date_str):
+def event_has_team(event, keys):
+    for comp in event.get("competitions") or []:
+        for c in comp.get("competitors", []):
+            team = c.get("team") or {}
+            fields = [str(team.get(k, "")).lower()
+                      for k in ("displayName", "shortDisplayName", "name", "abbreviation", "location")]
+            if any(f in keys for f in fields):
+                return True
+    return False
+
+
+def fetch_espn_section(sources, date_str, team_filter=None):
     games, logo = [], None
-    for label, sport_path, league_path in sources:
+    for rank, (label, sport_path, league_path) in enumerate(sources):
         payload = fetch_espn_scoreboard(sport_path, league_path, date_str)
-        if logo is None:
-            logo = extract_league_logo(payload)
         for event in payload.get("events", []):
-            games.append(format_espn_game(event, label))
+            if team_filter and not event_has_team(event, team_filter):
+                continue
+            if logo is None:
+                logo = extract_league_logo(payload)
+            g = format_espn_game(event, label)
+            g["rank"] = rank
+            games.append(g)
     return games, logo
 
 
@@ -311,7 +353,7 @@ def group_targets(cfg):
 def fetch_statsapi_group(group, date_dashed):
     """group: label -> {"sport_ids": [...], "leagues": [(sport_id, league_id)]}"""
     out, seen = [], set()
-    for label, cfg in group.items():
+    for rank, (label, cfg) in enumerate(group.items()):
         for sid, lid in group_targets(cfg):
             for g in fetch_statsapi_games(sid, date_dashed, lid):
                 pk = g.get("gamePk")
@@ -333,7 +375,7 @@ def fetch_statsapi_group(group, date_dashed):
                 elif state == "Live":
                     note = " (in progress)"
                 out.append({"line": f"{label}: {away} @ {home} — {fmt_time(dt)}{note}",
-                            "fav": False, "dt": dt})
+                            "fav": False, "dt": dt, "rank": rank})
     return out, None
 
 
@@ -347,6 +389,10 @@ def collect_sections(date_str, date_dashed):
         try:
             if kind == "espn":
                 games, logo = fetch_espn_section(cfg, date_str)
+            elif kind == "espn_usa":
+                games, logo = fetch_espn_section(cfg, date_str, team_filter=USA_TEAM_KEYS)
+            elif kind == "wbc":
+                games, logo = fetch_statsapi_group(WBC_OLYMPICS, date_dashed)
             elif kind == "intl_baseball":
                 games, logo = fetch_statsapi_group(INTL_BASEBALL, date_dashed)
             elif kind == "softball":
@@ -360,12 +406,12 @@ def collect_sections(date_str, date_dashed):
         except Exception as e:  # one broken league must never kill the digest
             print(f"[warn] section {name} failed: {e!r}", file=sys.stderr)
             games, logo = [], None
-        games.sort(key=lambda g: (not g["fav"], g["dt"] or FAR_FUTURE))
+        games.sort(key=lambda g: (not g["fav"], g.get("rank", 0), g["dt"] or FAR_FUTURE))
         results.append((name, emoji, games, logo))
     return results
 
 
-def section_embeds(name, emoji, games, logo):
+def section_embeds(name, emoji, games, logo, spoiler=False):
     chunks, cur, size = [], [], 0
     for g in games:
         line = g["line"]
@@ -379,9 +425,14 @@ def section_embeds(name, emoji, games, logo):
 
     embeds = []
     for i, chunk in enumerate(chunks):
+        body = "\n".join(chunk)
+        title = f"{emoji} {name}" + (" (cont.)" if i else "")
+        if spoiler:
+            body = f"||{body}||"
+            title += " — tap to reveal"
         embed = {
-            "title": f"{emoji} {name}" + (" (cont.)" if i else ""),
-            "description": "\n".join(chunk),
+            "title": title,
+            "description": body,
             "color": EMBED_COLOR,
         }
         if logo and i == 0:
@@ -417,7 +468,7 @@ def build_messages(sections, today_label):
         if not games:
             continue  # omit sports with nothing on today
         any_games = True
-        embeds.extend(section_embeds(name, emoji, games, logo))
+        embeds.extend(section_embeds(name, emoji, games, logo, spoiler=name in SPOILER_SECTIONS))
     if not any_games:
         embeds.append({"title": "Nothing today",
                        "description": "No games found across your tracked leagues.",
@@ -450,7 +501,7 @@ def run_probe(date_str, date_dashed):
 
     print("--- ESPN sections ---")
     for name, _, kind, cfg in SECTIONS:
-        if kind != "espn":
+        if kind not in ("espn", "espn_usa"):
             continue
         for label, sport_path, league_path in cfg:
             payload = fetch_espn_scoreboard(sport_path, league_path, date_str)
@@ -491,7 +542,8 @@ def run_probe(date_str, date_dashed):
                   f"| games_today={n}")
 
     print("\n--- Configured international baseball / softball targets ---")
-    for title, group in (("baseball", INTL_BASEBALL), ("softball", SOFTBALL)):
+    for title, group in (("wbc/olympics", WBC_OLYMPICS), ("baseball", INTL_BASEBALL),
+                         ("softball", SOFTBALL)):
         for label, cfg in group.items():
             for sid, lid in group_targets(cfg):
                 n = len(fetch_statsapi_games(sid, date_dashed, lid))
