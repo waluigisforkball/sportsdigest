@@ -7,7 +7,13 @@ on:
     # local hour and exits early on the "wrong" one for the current season.
     - cron: "30 10 * * *"  # 6:30am EDT / 5:30am EST
     - cron: "30 11 * * *"  # 7:30am EDT / 6:30am EST
-  workflow_dispatch: {}  # allows manual run from the Actions tab for testing
+  workflow_dispatch:  # manual run from the Actions tab (also what cron-job.org calls)
+    inputs:
+      probe:
+        description: "Probe mode: print what each league endpoint returns, post nothing"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   send-digest:
@@ -26,16 +32,20 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+          PROBE: ${{ github.event.inputs.probe }}
         run: python daily_digest.py
 
       - name: Keep-alive commit
         # GitHub auto-disables scheduled workflows after 60 days with no repo
         # activity. This commits a small timestamp file every run so the repo
         # never goes quiet, keeping the schedule alive indefinitely.
+        # Also commits last_post_date.txt, which the script uses to avoid
+        # double-posting from the two DST-covering cron triggers.
         run: |
           echo "Last run: $(date -u)" > .last_run
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .last_run
+          [ -f last_post_date.txt ] && git add last_post_date.txt
           git diff --quiet && git diff --staged --quiet || git commit -m "chore: keep-alive [skip ci]"
           git push
